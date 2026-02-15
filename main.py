@@ -1,12 +1,16 @@
+import math
 import sys
 import os
 import sqlite3
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QStringListModel
+from thefuzz import fuzz
+
+from PySide6.QtCore import Qt, QSortFilterProxyModel, QStringListModel, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -227,6 +231,17 @@ def fetch_ingredients_for_recipe(con: sqlite3.Connection, recipe_id: int) -> Lis
     return out
 
 
+def fetch_ingredient_names_by_recipe(con: sqlite3.Connection) -> Dict[int, List[str]]:
+    cur = con.execute("SELECT recipe_id, name FROM ingredients ORDER BY recipe_id, sort_order")
+    out: Dict[int, List[str]] = {}
+    for r in cur.fetchall():
+        rid = int(r["recipe_id"])
+        if rid not in out:
+            out[rid] = []
+        out[rid].append(str(r["name"] or ""))
+    return out
+
+
 _number_re = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*$")
 
 
@@ -242,6 +257,116 @@ def try_parse_number(s: str) -> Optional[float]:
 
 def normalize_key(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+MAX_SEARCH_RESULTS = 20
+
+_tokenize_re = re.compile(r"[a-z0-9]+")
+
+
+def tokenize(text: str) -> List[str]:
+    return _tokenize_re.findall(text.lower())
+
+
+class SearchIndex:
+    def __init__(self, recipes: List["Recipe"], ingredient_map: Dict[int, List[str]]):
+        self.recipes = recipes
+        self.ingredient_map = ingredient_map
+        self.name_tokens: Dict[int, List[str]] = {}
+        self.ing_tokens: Dict[int, List[str]] = {}
+        self.name_lower: Dict[int, str] = {}
+        self.ing_text_lower: Dict[int, str] = {}
+        self.doc_freqs: Counter = Counter()
+        self.doc_count = len(recipes)
+        self.tfidf_vecs: Dict[int, Dict[str, float]] = {}
+
+        for r in recipes:
+            ntoks = tokenize(r.name)
+            self.name_tokens[r.id] = ntoks
+            self.name_lower[r.id] = r.name.lower()
+            ing_names = ingredient_map.get(r.id, [])
+            itoks = []
+            for iname in ing_names:
+                itoks.extend(tokenize(iname))
+            self.ing_tokens[r.id] = itoks
+            self.ing_text_lower[r.id] = " ".join(n.lower() for n in ing_names)
+            all_toks = set(ntoks + itoks)
+            for t in all_toks:
+                self.doc_freqs[t] += 1
+
+        for r in recipes:
+            all_toks = self.name_tokens[r.id] + self.ing_tokens[r.id]
+            tf = Counter(all_toks)
+            total = len(all_toks) or 1
+            vec: Dict[str, float] = {}
+            for tok, count in tf.items():
+                df = self.doc_freqs.get(tok, 1)
+                idf = math.log((self.doc_count + 1) / (df + 1)) + 1
+                vec[tok] = (count / total) * idf
+            self.tfidf_vecs[r.id] = vec
+
+    def _cosine(self, vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float:
+        keys = set(vec_a) & set(vec_b)
+        if not keys:
+            return 0.0
+        dot = sum(vec_a[k] * vec_b[k] for k in keys)
+        mag_a = math.sqrt(sum(v * v for v in vec_a.values()))
+        mag_b = math.sqrt(sum(v * v for v in vec_b.values()))
+        if mag_a == 0 or mag_b == 0:
+            return 0.0
+        return dot / (mag_a * mag_b)
+
+    def search(self, query: str) -> List[Tuple[int, float]]:
+        query = query.strip()
+        if not query:
+            return [(r.id, 0.0) for r in self.recipes]
+
+        ql = query.lower()
+        qtoks = tokenize(query)
+        if not qtoks:
+            return [(r.id, 0.0) for r in self.recipes]
+
+        qtf = Counter(qtoks)
+        total_q = len(qtoks) or 1
+        qvec: Dict[str, float] = {}
+        for tok, count in qtf.items():
+            df = self.doc_freqs.get(tok, 1)
+            idf = math.log((self.doc_count + 1) / (df + 1)) + 1
+            qvec[tok] = (count / total_q) * idf
+
+        scored: List[Tuple[int, float]] = []
+        for r in self.recipes:
+            score = 0.0
+
+            name_l = self.name_lower[r.id]
+            if ql in name_l:
+                score += 100.0
+                if name_l == ql:
+                    score += 50.0
+                elif name_l.startswith(ql):
+                    score += 25.0
+
+            ing_l = self.ing_text_lower[r.id]
+            if ql in ing_l:
+                score += 40.0
+
+            tfidf_score = self._cosine(qvec, self.tfidf_vecs[r.id])
+            score += tfidf_score * 30.0
+
+            if len(ql) >= 4:
+                name_fuzz = fuzz.partial_ratio(ql, name_l)
+                if name_fuzz >= 75:
+                    score += (name_fuzz / 100.0) * 15.0
+
+                if ing_l:
+                    ing_fuzz = fuzz.partial_ratio(ql, ing_l)
+                    if ing_fuzz >= 85:
+                        score += (ing_fuzz / 100.0) * 10.0
+
+            scored.append((r.id, score))
+
+        scored.sort(key=lambda x: (-x[1], self.name_lower.get(x[0], "")))
+        return scored
 
 
 def export_pdf_lines(path: Path, title: str, lines: List[str]) -> None:
@@ -261,6 +386,115 @@ def export_pdf_lines(path: Path, title: str, lines: List[str]) -> None:
             c.setFont("Helvetica", 11)
         c.drawString(x, y, line)
         y -= line_height
+    c.save()
+
+
+def wrap_text(text: str, font_name: str, font_size: int, max_width: float) -> List[str]:
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    wrapped: List[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph.strip():
+            wrapped.append("")
+            continue
+        words = paragraph.split()
+        if not words:
+            wrapped.append("")
+            continue
+        current = words[0]
+        for w in words[1:]:
+            test = current + " " + w
+            if stringWidth(test, font_name, font_size) <= max_width:
+                current = test
+            else:
+                wrapped.append(current)
+                current = w
+        wrapped.append(current)
+    return wrapped
+
+
+def export_recipe_card_pdf(path: Path, recipe: "Recipe", ingredients: List["Ingredient"]) -> None:
+    c = Canvas(str(path), pagesize=letter)
+    width, height = letter
+    margin = 72
+    max_w = width - 2 * margin
+    y = height - margin
+
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(margin, y, recipe.name)
+    y -= 24
+
+    meta_parts = [f"Category: {recipe.category}"]
+    if recipe.prep_time:
+        meta_parts.append(f"Prep: {recipe.prep_time}")
+    if recipe.cook_time:
+        meta_parts.append(f"Cook: {recipe.cook_time}")
+    if recipe.total_time:
+        meta_parts.append(f"Total: {recipe.total_time}")
+    if recipe.servings:
+        meta_parts.append(f"Servings: {recipe.servings}")
+    if recipe.gluten_free:
+        meta_parts.append("Gluten-free")
+    c.setFont("Helvetica", 10)
+    c.drawString(margin, y, "  |  ".join(meta_parts))
+    y -= 10
+    c.setLineWidth(0.5)
+    c.line(margin, y, width - margin, y)
+    y -= 18
+
+    def check_page(needed: float) -> float:
+        nonlocal y
+        if y - needed < margin:
+            c.showPage()
+            y = height - margin
+        return y
+
+    if ingredients:
+        check_page(20)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(margin, y, "Ingredients")
+        y -= 18
+        c.setFont("Helvetica", 11)
+        for ing in ingredients:
+            check_page(14)
+            parts = []
+            if (ing.quantity or "").strip():
+                parts.append(ing.quantity.strip())
+            if (ing.unit or "").strip():
+                parts.append(ing.unit.strip())
+            parts.append(ing.name.strip())
+            if (ing.preparation or "").strip():
+                parts.append(f"({ing.preparation.strip()})")
+            if ing.optional:
+                parts.append("[optional]")
+            c.drawString(margin + 12, y, "\u2022  " + " ".join(parts))
+            y -= 14
+
+    if (recipe.instructions or "").strip():
+        y -= 8
+        check_page(20)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(margin, y, "Instructions")
+        y -= 18
+        c.setFont("Helvetica", 11)
+        wrapped = wrap_text(recipe.instructions.strip(), "Helvetica", 11, max_w - 12)
+        for line in wrapped:
+            check_page(14)
+            c.drawString(margin + 12, y, line)
+            y -= 14
+
+    if (recipe.notes or "").strip():
+        y -= 8
+        check_page(20)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(margin, y, "Notes")
+        y -= 18
+        c.setFont("Helvetica", 11)
+        wrapped = wrap_text(recipe.notes.strip(), "Helvetica", 11, max_w - 12)
+        for line in wrapped:
+            check_page(14)
+            c.drawString(margin + 12, y, line)
+            y -= 14
+
     c.save()
 
 
@@ -293,8 +527,12 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(8, 8, 8, 8)
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search recipes...")
-        self.search.textChanged.connect(self.apply_filters)
+        self.search.setPlaceholderText("Search recipes or ingredients...")
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(800)
+        self._search_timer.timeout.connect(self.apply_filters)
+        self.search.textChanged.connect(self._on_search_changed)
         left_layout.addWidget(self.search)
 
         self.category = QComboBox()
@@ -307,12 +545,17 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.list_widget, 1)
 
         button_row = QHBoxLayout()
-        self.btn_export_recipe = QPushButton("Export Selected Recipe Ingredients PDF")
+        self.btn_export_card = QPushButton("Export Recipe Card PDF")
+        self.btn_export_card.clicked.connect(self.export_recipe_card)
+        self.btn_export_card.setEnabled(False)
+        button_row.addWidget(self.btn_export_card)
+
+        self.btn_export_recipe = QPushButton("Export Ingredients PDF")
         self.btn_export_recipe.clicked.connect(self.export_selected_recipe_pdf)
         self.btn_export_recipe.setEnabled(False)
         button_row.addWidget(self.btn_export_recipe)
 
-        self.btn_export_shopping = QPushButton("Export Consolidated Shopping List PDF")
+        self.btn_export_shopping = QPushButton("Export Shopping List PDF")
         self.btn_export_shopping.clicked.connect(self.export_shopping_list_pdf)
         self.btn_export_shopping.setEnabled(False)
         button_row.addWidget(self.btn_export_shopping)
@@ -377,6 +620,8 @@ class MainWindow(QMainWindow):
     def refresh_data(self) -> None:
         self.all_recipes = fetch_recipes(self.con)
         self.recipe_by_id = {r.id: r for r in self.all_recipes}
+        self.ingredient_names = fetch_ingredient_names_by_recipe(self.con)
+        self.search_index = SearchIndex(self.all_recipes, self.ingredient_names)
 
         cats = fetch_categories(self.con)
         self.category.blockSignals(True)
@@ -386,35 +631,38 @@ class MainWindow(QMainWindow):
             self.category.addItem(c)
         self.category.blockSignals(False)
 
-        self.populate_list()
         self.apply_filters()
         self.on_selection_changed()
 
-    def populate_list(self) -> None:
+    def _on_search_changed(self) -> None:
+        self._search_timer.start()
+
+    def apply_filters(self) -> None:
+        text = (self.search.text() or "").strip()
+        cat = self.category.currentText()
+        use_cat = cat != "All Categories"
+
+        scored = self.search_index.search(text)
+        has_query = bool(text)
+
+        if use_cat:
+            scored = [(rid, s) for rid, s in scored if (self.recipe_by_id.get(rid) and self.recipe_by_id[rid].category == cat)]
+
+        if has_query:
+            scored = [(rid, s) for rid, s in scored if s > 0]
+            scored = scored[:MAX_SEARCH_RESULTS]
+
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
-        for r in self.all_recipes:
+        for rid, _ in scored:
+            r = self.recipe_by_id.get(rid)
+            if not r:
+                continue
             item = QListWidgetItem(r.name)
             item.setData(Qt.UserRole, r.id)
             item.setData(Qt.UserRole + 1, r.category)
             self.list_widget.addItem(item)
         self.list_widget.blockSignals(False)
-
-    def apply_filters(self) -> None:
-        text = (self.search.text() or "").strip().lower()
-        cat = self.category.currentText()
-        use_cat = cat != "All Categories"
-
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            name = (item.text() or "").lower()
-            item_cat = item.data(Qt.UserRole + 1) or ""
-            visible = True
-            if text and text not in name:
-                visible = False
-            if use_cat and (item_cat or "") != cat:
-                visible = False
-            item.setHidden(not visible)
 
     def selected_recipe_ids(self) -> List[int]:
         ids: List[int] = []
@@ -428,6 +676,7 @@ class MainWindow(QMainWindow):
         ids = self.selected_recipe_ids()
         self.btn_export_shopping.setEnabled(len(ids) >= 1)
         self.btn_export_recipe.setEnabled(len(ids) == 1)
+        self.btn_export_card.setEnabled(len(ids) == 1)
         self.update_details(ids)
         self.update_shopping(ids)
 
@@ -577,6 +826,20 @@ class MainWindow(QMainWindow):
         if not path_str:
             return
         export_pdf_lines(Path(path_str), f"Ingredients: {r.name}", lines)
+
+    def export_recipe_card(self) -> None:
+        ids = self.selected_recipe_ids()
+        if len(ids) != 1:
+            return
+        r = self.recipe_by_id.get(ids[0])
+        if not r:
+            return
+        ings = fetch_ingredients_for_recipe(self.con, r.id)
+        default_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", r.name.strip()).strip("_") or "recipe"
+        path_str, _ = QFileDialog.getSaveFileName(self, "Save PDF", f"{default_name}_recipe_card.pdf", "PDF Files (*.pdf)")
+        if not path_str:
+            return
+        export_recipe_card_pdf(Path(path_str), r, ings)
 
     def export_shopping_list_pdf(self) -> None:
         ids = self.selected_recipe_ids()
