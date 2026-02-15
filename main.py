@@ -1,3 +1,4 @@
+import json
 import math
 import sys
 import sqlite3
@@ -244,6 +245,228 @@ def fetch_ingredient_names_by_recipe(con: sqlite3.Connection) -> Dict[int, List[
             out[rid] = []
         out[rid].append(str(r["name"] or ""))
     return out
+
+
+VALID_CATEGORIES = {"Appetizer", "Beverage", "Dessert", "Main", "Salad", "Sauce", "Side", "Soup"}
+
+VALID_RECIPE_KEYS = {"name", "category", "gluten_free", "notes", "instructions",
+                     "prep_time", "cook_time", "total_time", "servings", "ingredients"}
+
+REQUIRED_RECIPE_KEYS = {"name", "category", "gluten_free", "instructions", "ingredients"}
+
+VALID_INGREDIENT_KEYS = {"name", "quantity", "unit", "preparation", "optional", "sort_order"}
+
+REQUIRED_INGREDIENT_KEYS = {"name", "quantity", "unit", "sort_order"}
+
+
+def validate_llm_response(raw_text: str) -> Tuple[Optional[Dict], List[str]]:
+    raw_text = raw_text.strip()
+    if raw_text.startswith("```"):
+        lines = raw_text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw_text = "\n".join(lines).strip()
+
+    errors: List[str] = []
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return None, [f"Response is not valid JSON: {exc}"]
+
+    if not isinstance(data, dict):
+        return None, ["Response must be a JSON object (dict), not " + type(data).__name__]
+
+    extra_keys = set(data.keys()) - VALID_RECIPE_KEYS
+    if extra_keys:
+        errors.append(f"Unexpected top-level keys: {sorted(extra_keys)}. Remove them.")
+
+    for key in REQUIRED_RECIPE_KEYS:
+        if key not in data:
+            errors.append(f"Missing required key: \"{key}\"")
+
+    if errors:
+        return None, errors
+
+    if not isinstance(data["name"], str) or not data["name"].strip():
+        errors.append("\"name\" must be a non-empty string.")
+
+    if data["category"] not in VALID_CATEGORIES:
+        errors.append(
+            f"\"category\" must be one of {sorted(VALID_CATEGORIES)}. Got: \"{data['category']}\"")
+
+    if not isinstance(data["gluten_free"], bool):
+        errors.append("\"gluten_free\" must be a boolean (true/false), not " + type(data["gluten_free"]).__name__)
+
+    if not isinstance(data["instructions"], str) or not data["instructions"].strip():
+        errors.append("\"instructions\" must be a non-empty string.")
+
+    for opt_key in ("notes", "prep_time", "cook_time", "total_time", "servings"):
+        if opt_key in data:
+            if data[opt_key] is None:
+                errors.append(f"\"{opt_key}\" must be a string, not null. Use \"\" for empty.")
+            elif not isinstance(data[opt_key], str):
+                errors.append(f"\"{opt_key}\" must be a string, got {type(data[opt_key]).__name__}")
+
+    if not isinstance(data["ingredients"], list):
+        errors.append("\"ingredients\" must be an array.")
+        return None, errors
+
+    if len(data["ingredients"]) == 0:
+        errors.append("\"ingredients\" must contain at least one ingredient.")
+
+    seen_sort_orders = set()
+    for idx, ing in enumerate(data["ingredients"]):
+        prefix = f"ingredients[{idx}]"
+
+        if not isinstance(ing, dict):
+            errors.append(f"{prefix}: must be a JSON object, not {type(ing).__name__}")
+            continue
+
+        ing_extra = set(ing.keys()) - VALID_INGREDIENT_KEYS
+        if ing_extra:
+            errors.append(f"{prefix}: unexpected keys: {sorted(ing_extra)}. Remove them.")
+
+        for req in REQUIRED_INGREDIENT_KEYS:
+            if req not in ing:
+                errors.append(f"{prefix}: missing required key \"{req}\"")
+
+        if "name" in ing:
+            if not isinstance(ing["name"], str) or not ing["name"].strip():
+                errors.append(f"{prefix}: \"name\" must be a non-empty string.")
+
+        if "quantity" in ing:
+            if not isinstance(ing["quantity"], str):
+                errors.append(
+                    f"{prefix}: \"quantity\" must be a string, got {type(ing['quantity']).__name__}."
+                    " Use \"\" for unmeasured, fractions like \"1/2\", or whole numbers like \"3\".")
+
+        if "unit" in ing:
+            if not isinstance(ing["unit"], str):
+                errors.append(f"{prefix}: \"unit\" must be a string, got {type(ing['unit']).__name__}")
+
+        if "sort_order" in ing:
+            if not isinstance(ing["sort_order"], int):
+                errors.append(f"{prefix}: \"sort_order\" must be an integer, got {type(ing['sort_order']).__name__}")
+            else:
+                if ing["sort_order"] in seen_sort_orders:
+                    errors.append(f"{prefix}: duplicate sort_order {ing['sort_order']}")
+                seen_sort_orders.add(ing["sort_order"])
+
+        if "preparation" in ing:
+            if ing["preparation"] is None:
+                errors.append(f"{prefix}: \"preparation\" must be a string, not null. Use \"\".")
+            elif not isinstance(ing["preparation"], str):
+                errors.append(f"{prefix}: \"preparation\" must be a string")
+
+        if "optional" in ing:
+            if not isinstance(ing["optional"], bool):
+                errors.append(f"{prefix}: \"optional\" must be a boolean (true/false)")
+
+    if errors:
+        return None, errors
+
+    return data, []
+
+
+def build_retry_prompt(original_response: str, validation_errors: List[str]) -> str:
+    error_block = "\n".join(f"  - {e}" for e in validation_errors)
+    return (
+        "Your previous response failed structural validation. You MUST fix every issue listed below "
+        "and return a corrected JSON object. Do not add explanatory text. Output ONLY the raw JSON "
+        "object starting with { and ending with }.\n"
+        "\n"
+        "VALIDATION ERRORS:\n"
+        f"{error_block}\n"
+        "\n"
+        "YOUR PREVIOUS RESPONSE (which had errors):\n"
+        f"{original_response}\n"
+        "\n"
+        "RULES REMINDER:\n"
+        "- Output must be a single JSON object parseable by json.loads()\n"
+        "- Required recipe keys: name (string), category (one of: Appetizer, Beverage, Dessert, "
+        "Main, Salad, Sauce, Side, Soup), gluten_free (boolean), instructions (string), "
+        "ingredients (array)\n"
+        "- Optional recipe keys (use \"\" if empty, never null): notes, prep_time, cook_time, "
+        "total_time, servings\n"
+        "- Each ingredient object requires: name (string), quantity (string), unit (string), "
+        "sort_order (integer)\n"
+        "- Optional ingredient keys: preparation (string, default \"\"), optional (boolean, default false)\n"
+        "- No extra keys anywhere. No null values. No markdown fences.\n"
+        "- quantity must be a string: \"1/2\", \"3\", \"\", etc. Never a number type.\n"
+        "\n"
+        "Return the corrected JSON now."
+    )
+
+
+def insert_recipe_from_llm(con: sqlite3.Connection, data: Dict) -> int:
+    name = data["name"].strip()
+    category = data["category"]
+    gluten_free = 1 if data["gluten_free"] else 0
+    notes = (data.get("notes") or "").strip()
+    instructions = data["instructions"].strip()
+    prep_time = (data.get("prep_time") or "").strip()
+    cook_time = (data.get("cook_time") or "").strip()
+    total_time = (data.get("total_time") or "").strip()
+    servings = (data.get("servings") or "").strip()
+
+    cur = con.execute(
+        "INSERT INTO recipes (name, category, gluten_free, notes, instructions, "
+        "prep_time, cook_time, total_time, servings) VALUES (?,?,?,?,?,?,?,?,?)",
+        (name, category, gluten_free, notes, instructions,
+         prep_time, cook_time, total_time, servings),
+    )
+    recipe_id = int(cur.lastrowid)
+
+    for ing in data["ingredients"]:
+        iname = ing["name"].strip()
+        quantity = (ing.get("quantity") or "").strip()
+        unit = (ing.get("unit") or "").strip()
+        preparation = (ing.get("preparation") or "").strip()
+        optional = 1 if ing.get("optional", False) else 0
+        sort_order = int(ing.get("sort_order", 0))
+        con.execute(
+            "INSERT INTO ingredients (recipe_id, name, quantity, unit, preparation, optional, sort_order) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (recipe_id, iname, quantity, unit, preparation, optional, sort_order),
+        )
+
+    con.commit()
+    return recipe_id
+
+
+def load_prompt_template() -> str:
+    prompt_path = app_dir() / "sample_prompt.txt"
+    return prompt_path.read_text(encoding="utf-8")
+
+
+def build_extraction_prompt(recipe_text: str) -> str:
+    template = load_prompt_template()
+    return template.replace("{recipe_text}", recipe_text)
+
+
+MAX_LLM_RETRIES = 2
+
+
+def process_llm_recipe(con: sqlite3.Connection, send_fn, recipe_text: str) -> Tuple[bool, str, int]:
+    prompt = build_extraction_prompt(recipe_text)
+    response = send_fn(prompt)
+    data, errors = validate_llm_response(response)
+
+    for attempt in range(MAX_LLM_RETRIES):
+        if data is not None:
+            break
+        retry_prompt = build_retry_prompt(response, errors)
+        response = send_fn(retry_prompt)
+        data, errors = validate_llm_response(response)
+
+    if data is None:
+        return False, "Validation failed after retries:\n" + "\n".join(errors), 0
+
+    recipe_id = insert_recipe_from_llm(con, data)
+    return True, data["name"], recipe_id
 
 
 def normalize_key(name: str) -> str:
