@@ -1,30 +1,34 @@
 import math
 import sys
-import os
 import sqlite3
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from thefuzz import fuzz
 
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QStringListModel, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -242,21 +246,181 @@ def fetch_ingredient_names_by_recipe(con: sqlite3.Connection) -> Dict[int, List[
     return out
 
 
-_number_re = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*$")
-
-
-def try_parse_number(s: str) -> Optional[float]:
-    m = _number_re.match(s or "")
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-
 def normalize_key(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+_frac_re = re.compile(r"(\d+)\s*/\s*(\d+)")
+_mixed_re = re.compile(r"^(\d+)\s+(\d+)\s*/\s*(\d+)$")
+_whole_re = re.compile(r"^(\d+(?:\.\d+)?)$")
+_range_re = re.compile(r"^(\S+)\s*[-–]\s*(\S+)$")
+_compound_re = re.compile(r"(.+?)\s*\+\s*(.+)")
+
+
+def parse_quantity(text: str) -> Optional[Fraction]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    m = _mixed_re.match(text)
+    if m:
+        w, n, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if d == 0:
+            return None
+        return Fraction(w) + Fraction(n, d)
+    m = _frac_re.match(text)
+    if m:
+        n, d = int(m.group(1)), int(m.group(2))
+        if d == 0:
+            return None
+        return Fraction(n, d)
+    m = _whole_re.match(text)
+    if m:
+        try:
+            return Fraction(m.group(1)).limit_denominator(1000)
+        except (ValueError, ZeroDivisionError):
+            return None
+    m = _range_re.match(text)
+    if m:
+        lo = parse_quantity(m.group(1))
+        hi = parse_quantity(m.group(2))
+        if lo is not None and hi is not None:
+            return (lo + hi) / 2
+        return lo or hi
+    return None
+
+
+def fraction_to_str(f: Fraction) -> str:
+    if f <= 0:
+        return "0"
+    whole = int(f)
+    remainder = f - whole
+    if remainder == 0:
+        return str(whole)
+    remainder = remainder.limit_denominator(16)
+    if remainder == 0:
+        return str(whole)
+    if whole == 0:
+        return f"{remainder.numerator}/{remainder.denominator}"
+    return f"{whole} {remainder.numerator}/{remainder.denominator}"
+
+
+UNIT_ALIASES: Dict[str, str] = {
+    "cup": "cup", "cups": "cup", "c": "cup", "c.": "cup",
+    "tbsp": "tbsp", "tablespoon": "tbsp", "tablespoons": "tbsp",
+    "tbs": "tbsp", "tbs.": "tbsp", "tbsp.": "tbsp", "t": "tbsp",
+    "tsp": "tsp", "teaspoon": "tsp", "teaspoons": "tsp",
+    "tsp.": "tsp",
+    "oz": "oz", "ounce": "oz", "ounces": "oz", "oz.": "oz",
+    "lb": "lb", "lbs": "lb", "pound": "lb", "pounds": "lb",
+    "lb.": "lb", "lbs.": "lb",
+    "gal": "gal", "gallon": "gal", "gallons": "gal",
+    "qt": "qt", "quart": "qt", "quarts": "qt",
+    "pt": "pt", "pint": "pt", "pints": "pt",
+    "fl oz": "fl_oz", "fluid ounce": "fl_oz", "fluid ounces": "fl_oz",
+    "ml": "ml", "milliliter": "ml", "milliliters": "ml", "millilitre": "ml",
+    "l": "liter", "liter": "liter", "liters": "liter", "litre": "liter",
+    "g": "g", "gram": "g", "grams": "g", "gramme": "g",
+    "kg": "kg", "kilogram": "kg", "kilograms": "kg",
+    "dash": "dash", "pinch": "pinch",
+    "clove": "clove", "cloves": "clove",
+    "head": "head", "heads": "head",
+    "sprig": "sprig", "sprigs": "sprig",
+    "stick": "stick", "sticks": "stick",
+    "stalk": "stalk", "stalks": "stalk",
+    "slice": "slice", "slices": "slice",
+    "large": "large", "medium": "medium", "small": "small",
+    "can": "can", "cans": "can",
+    "package": "package", "packages": "package", "pkg": "package",
+    "bunch": "bunch", "bunches": "bunch",
+    "ear": "ear", "ears": "ear",
+}
+
+VOLUME_TO_TSP: Dict[str, Fraction] = {
+    "tsp": Fraction(1),
+    "tbsp": Fraction(3),
+    "fl_oz": Fraction(6),
+    "cup": Fraction(48),
+    "pt": Fraction(96),
+    "qt": Fraction(192),
+    "gal": Fraction(768),
+    "ml": Fraction(48, 237),
+    "liter": Fraction(48000, 237),
+}
+
+WEIGHT_TO_OZ: Dict[str, Fraction] = {
+    "oz": Fraction(1),
+    "lb": Fraction(16),
+    "g": Fraction(1000, 28349),
+    "kg": Fraction(1000000, 28349),
+}
+
+def canonical_unit(raw: str) -> str:
+    raw = (raw or "").strip().lower()
+    canned_re = re.match(r"^(\d+(?:\.\d+)?)\s*oz\s+(can|cans)$", raw)
+    if canned_re:
+        return raw
+    return UNIT_ALIASES.get(raw, raw)
+
+
+def convert_to_base(qty: Fraction, unit: str) -> Optional[Tuple[Fraction, str]]:
+    if unit in VOLUME_TO_TSP:
+        return (qty * VOLUME_TO_TSP[unit], "vol_tsp")
+    if unit in WEIGHT_TO_OZ:
+        return (qty * WEIGHT_TO_OZ[unit], "wt_oz")
+    return None
+
+
+SHOPPING_VOLUME: List[Tuple[str, Fraction, str]] = [
+    ("cup", Fraction(48), "cup"),
+    ("tbsp", Fraction(3), "tbsp"),
+    ("tsp", Fraction(1), "tsp"),
+]
+
+SHOPPING_WEIGHT: List[Tuple[str, Fraction, str]] = [
+    ("lb", Fraction(16), "lb"),
+    ("oz", Fraction(1), "oz"),
+]
+
+
+UNIT_THRESHOLDS: Dict[str, Fraction] = {
+    "cup": Fraction(1, 4),
+    "lb": Fraction(1, 2),
+}
+
+
+def best_display_unit(base_val: Fraction, measure_type: str) -> Tuple[str, Fraction]:
+    if measure_type == "vol_tsp":
+        table = SHOPPING_VOLUME
+    elif measure_type == "wt_oz":
+        table = SHOPPING_WEIGHT
+    else:
+        return ("", base_val)
+    for unit_name, factor, display in table:
+        converted = base_val / factor
+        threshold = UNIT_THRESHOLDS.get(display, Fraction(1))
+        if converted >= threshold:
+            return (display, converted)
+    return (table[-1][2], base_val / table[-1][1])
+
+
+ROUND_FRACTIONS = [
+    Fraction(1, 8), Fraction(1, 4), Fraction(1, 3), Fraction(1, 2),
+    Fraction(2, 3), Fraction(3, 4), Fraction(1),
+]
+
+
+def round_to_common(f: Fraction) -> Fraction:
+    if f <= 0:
+        return Fraction(0)
+    whole = int(f)
+    remainder = f - whole
+    if remainder == 0:
+        return f
+    candidates = [Fraction(whole) + rf for rf in ROUND_FRACTIONS]
+    at_or_above = [c for c in candidates if c >= f]
+    if at_or_above:
+        return min(at_or_above)
+    return Fraction(whole + 1)
 
 
 MAX_SEARCH_RESULTS = 20
@@ -503,10 +667,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.con = con
         self.setWindowTitle("Cookbook")
-        self.resize(1100, 700)
+        self.resize(1100, 780)
 
         self.all_recipes: List[Recipe] = []
         self.recipe_by_id: Dict[int, Recipe] = {}
+        self.selected_recipes: List[Tuple[int, int]] = []
 
         self.toolbar = QToolBar("Main")
         self.addToolBar(self.toolbar)
@@ -517,10 +682,10 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
+        root_layout = QVBoxLayout(central)
 
         splitter = QSplitter(Qt.Horizontal)
-        root_layout.addWidget(splitter)
+        root_layout.addWidget(splitter, 1)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -530,7 +695,7 @@ class MainWindow(QMainWindow):
         self.search.setPlaceholderText("Search recipes or ingredients...")
         self._search_timer = QTimer()
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(800)
+        self._search_timer.setInterval(750)
         self._search_timer.timeout.connect(self.apply_filters)
         self.search.textChanged.connect(self._on_search_changed)
         left_layout.addWidget(self.search)
@@ -540,8 +705,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.category)
 
         self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list_widget.itemSelectionChanged.connect(self.on_selection_changed)
+        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_recipe_context_menu)
         left_layout.addWidget(self.list_widget, 1)
 
         button_row = QHBoxLayout()
@@ -554,11 +721,6 @@ class MainWindow(QMainWindow):
         self.btn_export_recipe.clicked.connect(self.export_selected_recipe_pdf)
         self.btn_export_recipe.setEnabled(False)
         button_row.addWidget(self.btn_export_recipe)
-
-        self.btn_export_shopping = QPushButton("Export Shopping List PDF")
-        self.btn_export_shopping.clicked.connect(self.export_shopping_list_pdf)
-        self.btn_export_shopping.setEnabled(False)
-        button_row.addWidget(self.btn_export_shopping)
         left_layout.addLayout(button_row)
 
         right = QWidget()
@@ -615,6 +777,44 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
 
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        root_layout.addWidget(sep)
+
+        bottom = QWidget()
+        bottom_layout = QVBoxLayout(bottom)
+        bottom_layout.setContentsMargins(8, 4, 8, 8)
+
+        bottom_header = QHBoxLayout()
+        bottom_header.addWidget(QLabel("Selected Recipes"))
+        bottom_header.addStretch()
+
+        self.btn_clear_selected = QPushButton("Clear All")
+        self.btn_clear_selected.clicked.connect(self._clear_selected_recipes)
+        bottom_header.addWidget(self.btn_clear_selected)
+
+        self.btn_export_shopping = QPushButton("Export Shopping List PDF")
+        self.btn_export_shopping.clicked.connect(self.export_shopping_list_pdf)
+        self.btn_export_shopping.setEnabled(False)
+        bottom_header.addWidget(self.btn_export_shopping)
+
+        bottom_layout.addLayout(bottom_header)
+
+        self.selected_scroll = QScrollArea()
+        self.selected_scroll.setWidgetResizable(True)
+        self.selected_scroll.setFixedHeight(170)
+        self.selected_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.selected_container = QWidget()
+        self.selected_layout = QVBoxLayout(self.selected_container)
+        self.selected_layout.setContentsMargins(4, 4, 4, 4)
+        self.selected_layout.setSpacing(4)
+        self.selected_layout.addStretch()
+        self.selected_scroll.setWidget(self.selected_container)
+        bottom_layout.addWidget(self.selected_scroll)
+
+        root_layout.addWidget(bottom)
+
         self.refresh_data()
 
     def refresh_data(self) -> None:
@@ -664,6 +864,85 @@ class MainWindow(QMainWindow):
             self.list_widget.addItem(item)
         self.list_widget.blockSignals(False)
 
+    def _show_recipe_context_menu(self, pos) -> None:
+        item = self.list_widget.itemAt(pos)
+        if not item:
+            return
+        rid = item.data(Qt.UserRole)
+        if rid is None:
+            return
+        rid = int(rid)
+        menu = QMenu(self)
+        already = any(sr[0] == rid for sr in self.selected_recipes)
+        if already:
+            act = menu.addAction("Already in selected recipes")
+            act.setEnabled(False)
+        else:
+            act_add = menu.addAction("Add to Selected Recipes")
+            act_add.triggered.connect(lambda: self._add_to_selected(rid))
+        menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+
+    def _add_to_selected(self, rid: int) -> None:
+        if any(sr[0] == rid for sr in self.selected_recipes):
+            return
+        self.selected_recipes.append((rid, 1))
+        self._rebuild_selected_panel()
+        self._update_shopping_from_selected()
+
+    def _remove_from_selected(self, rid: int) -> None:
+        self.selected_recipes = [(r, m) for r, m in self.selected_recipes if r != rid]
+        self._rebuild_selected_panel()
+        self._update_shopping_from_selected()
+
+    def _set_multiplier(self, rid: int, val: int) -> None:
+        self.selected_recipes = [(r, val if r == rid else m) for r, m in self.selected_recipes]
+        self._update_shopping_from_selected()
+
+    def _clear_selected_recipes(self) -> None:
+        self.selected_recipes.clear()
+        self._rebuild_selected_panel()
+        self._update_shopping_from_selected()
+
+    def _rebuild_selected_panel(self) -> None:
+        while self.selected_layout.count() > 0:
+            child = self.selected_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        for rid, mult in self.selected_recipes:
+            r = self.recipe_by_id.get(rid)
+            if not r:
+                continue
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(4, 2, 4, 2)
+            row_layout.setSpacing(8)
+
+            lbl = QLabel(r.name)
+            lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            row_layout.addWidget(lbl)
+
+            row_layout.addWidget(QLabel("Servings \u00d7"))
+
+            spin = QSpinBox()
+            spin.setMinimum(1)
+            spin.setMaximum(20)
+            spin.setValue(mult)
+            spin.setFixedWidth(55)
+            captured_rid = rid
+            spin.valueChanged.connect(lambda v, r=captured_rid: self._set_multiplier(r, v))
+            row_layout.addWidget(spin)
+
+            btn_rm = QPushButton("Remove")
+            btn_rm.setFixedWidth(70)
+            btn_rm.clicked.connect(lambda _, r=captured_rid: self._remove_from_selected(r))
+            row_layout.addWidget(btn_rm)
+
+            self.selected_layout.addWidget(row_widget)
+
+        self.selected_layout.addStretch()
+        self.btn_export_shopping.setEnabled(len(self.selected_recipes) > 0)
+
     def selected_recipe_ids(self) -> List[int]:
         ids: List[int] = []
         for it in self.list_widget.selectedItems():
@@ -674,11 +953,10 @@ class MainWindow(QMainWindow):
 
     def on_selection_changed(self) -> None:
         ids = self.selected_recipe_ids()
-        self.btn_export_shopping.setEnabled(len(ids) >= 1)
-        self.btn_export_recipe.setEnabled(len(ids) == 1)
-        self.btn_export_card.setEnabled(len(ids) == 1)
+        single = len(ids) == 1
+        self.btn_export_recipe.setEnabled(single)
+        self.btn_export_card.setEnabled(single)
         self.update_details(ids)
-        self.update_shopping(ids)
 
     def update_details(self, ids: List[int]) -> None:
         self.ingredients_table.setRowCount(0)
@@ -720,74 +998,154 @@ class MainWindow(QMainWindow):
 
         self.instructions.setPlainText(r.instructions or "")
 
-    def consolidate_ingredients(self, recipe_ids: List[int]) -> List[Dict[str, Any]]:
-        accum: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for rid in recipe_ids:
+    def _parse_compound_qty(self, qty_text: str, unit_text: str) -> List[Tuple[Fraction, str]]:
+        qty_text = (qty_text or "").strip()
+        unit_text = (unit_text or "").strip()
+        if not qty_text and not unit_text:
+            return []
+        m = _compound_re.match(qty_text)
+        if m:
+            left_part = m.group(1).strip()
+            right_part = m.group(2).strip()
+            results: List[Tuple[Fraction, str]] = []
+            for part in [left_part, right_part]:
+                tokens = part.split()
+                part_unit = ""
+                part_qty_str = part
+                for i, tok in enumerate(tokens):
+                    if canonical_unit(tok) != tok.lower() or tok.lower() in UNIT_ALIASES:
+                        part_unit = tok
+                        part_qty_str = " ".join(tokens[:i] + tokens[i+1:])
+                        break
+                pq = parse_quantity(part_qty_str)
+                if pq is not None:
+                    results.append((pq, canonical_unit(part_unit) if part_unit else canonical_unit(unit_text)))
+            if results:
+                return results
+        pq = parse_quantity(qty_text)
+        if pq is not None:
+            return [(pq, canonical_unit(unit_text))]
+        return []
+
+    def consolidate_ingredients(self, recipe_mults: List[Tuple[int, int]]) -> List[Dict[str, Any]]:
+        accum: Dict[str, Dict[str, Any]] = {}
+        for rid, mult in recipe_mults:
             recipe = self.recipe_by_id.get(rid)
             if not recipe:
                 continue
             ings = fetch_ingredients_for_recipe(self.con, rid)
             for ing in ings:
-                key = (normalize_key(ing.name), (ing.unit or "").strip().lower())
-                if key not in accum:
-                    accum[key] = {
+                name_key = normalize_key(ing.name)
+                if name_key not in accum:
+                    accum[name_key] = {
                         "name": ing.name.strip(),
-                        "unit": (ing.unit or "").strip(),
-                        "quantity_value": 0.0,
-                        "quantity_texts": [],
-                        "quantity_is_numeric": True,
+                        "amounts": [],
+                        "raw_texts": [],
                         "prep_notes": set(),
                         "sources": set(),
-                        "optional_any": False,
+                        "optional_all": True,
                     }
-                entry = accum[key]
-                q = (ing.quantity or "").strip()
-                qnum = try_parse_number(q)
-                if q == "":
-                    entry["quantity_is_numeric"] = False
-                elif qnum is None:
-                    entry["quantity_is_numeric"] = False
-                    entry["quantity_texts"].append(q)
+                entry = accum[name_key]
+                parsed = self._parse_compound_qty(ing.quantity, ing.unit)
+                if parsed:
+                    for qty_frac, unit_canon in parsed:
+                        entry["amounts"].append((qty_frac * mult, unit_canon))
                 else:
-                    if entry["quantity_is_numeric"]:
-                        entry["quantity_value"] += qnum
-                    else:
-                        entry["quantity_texts"].append(q)
+                    raw = (ing.quantity or "").strip()
+                    if raw:
+                        display = raw
+                        u = (ing.unit or "").strip()
+                        if u:
+                            display = f"{raw} {u}"
+                        if mult > 1:
+                            display = f"{mult}\u00d7 {display}"
+                        entry["raw_texts"].append(display)
                 prep = (ing.preparation or "").strip()
                 if prep:
                     entry["prep_notes"].add(prep)
                 entry["sources"].add(recipe.name)
-                entry["optional_any"] = entry["optional_any"] or bool(ing.optional)
+                if not ing.optional:
+                    entry["optional_all"] = False
 
         out: List[Dict[str, Any]] = []
         for _, entry in accum.items():
-            if entry["quantity_is_numeric"]:
-                qty = entry["quantity_value"]
-                qty_str = str(int(qty)) if abs(qty - int(qty)) < 1e-9 else str(round(qty, 3)).rstrip("0").rstrip(".")
-            else:
-                uniq = []
-                for t in entry["quantity_texts"]:
-                    if t not in uniq:
-                        uniq.append(t)
-                qty_str = ", ".join(uniq) if uniq else ""
-            prep_notes = "; ".join(sorted(entry["prep_notes"]))
-            if entry["optional_any"]:
-                prep_notes = (prep_notes + " | Optional").strip(" |")
-            out.append(
-                {
-                    "name": entry["name"],
-                    "quantity": qty_str,
-                    "unit": entry["unit"],
-                    "prep": prep_notes,
-                    "sources": ", ".join(sorted(entry["sources"])),
-                }
-            )
+            vol_base = Fraction(0)
+            wt_base = Fraction(0)
+            count_by_unit: Dict[str, Fraction] = {}
+            has_vol = False
+            has_wt = False
 
-        out.sort(key=lambda d: (normalize_key(d["name"]), (d["unit"] or "").lower()))
+            for qty, u in entry["amounts"]:
+                converted = convert_to_base(qty, u)
+                if converted:
+                    base_val, base_type = converted
+                    if base_type == "vol_tsp":
+                        vol_base += base_val
+                        has_vol = True
+                    else:
+                        wt_base += base_val
+                        has_wt = True
+                else:
+                    if u not in count_by_unit:
+                        count_by_unit[u] = Fraction(0)
+                    count_by_unit[u] += qty
+
+            parts: List[str] = []
+            display_unit_parts: List[str] = []
+
+            if has_vol and vol_base > 0:
+                disp_unit, disp_val = best_display_unit(vol_base, "vol_tsp")
+                rounded = round_to_common(disp_val)
+                parts.append(fraction_to_str(rounded))
+                display_unit_parts.append(disp_unit)
+
+            if has_wt and wt_base > 0:
+                disp_unit, disp_val = best_display_unit(wt_base, "wt_oz")
+                rounded = round_to_common(disp_val)
+                parts.append(fraction_to_str(rounded))
+                display_unit_parts.append(disp_unit)
+
+            for u, total in sorted(count_by_unit.items()):
+                rounded = round_to_common(total)
+                parts.append(fraction_to_str(rounded))
+                display_unit_parts.append(u)
+
+            for rt in entry["raw_texts"]:
+                parts.append(rt)
+
+            qty_str = " + ".join(parts) if len(parts) > 1 else (parts[0] if parts else "")
+            unit_str = " + ".join(display_unit_parts) if len(display_unit_parts) > 1 else (display_unit_parts[0] if display_unit_parts else "")
+
+            if len(parts) <= 1 and len(display_unit_parts) <= 1:
+                pass
+            elif len(parts) > 1:
+                combined_parts = []
+                for i, p in enumerate(parts):
+                    u = display_unit_parts[i] if i < len(display_unit_parts) else ""
+                    combined_parts.append(f"{p} {u}".strip())
+                qty_str = " + ".join(combined_parts)
+                unit_str = ""
+
+            prep_notes = "; ".join(sorted(entry["prep_notes"]))
+            if entry["optional_all"] and entry["sources"]:
+                prep_notes = (prep_notes + " | Optional").strip(" |")
+
+            out.append({
+                "name": entry["name"],
+                "quantity": qty_str,
+                "unit": unit_str,
+                "prep": prep_notes,
+                "sources": ", ".join(sorted(entry["sources"])),
+            })
+
+        out.sort(key=lambda d: normalize_key(d["name"]))
         return out
 
-    def update_shopping(self, ids: List[int]) -> None:
-        rows = self.consolidate_ingredients(ids) if ids else []
+    def _update_shopping_from_selected(self) -> None:
+        self.update_shopping(self.selected_recipes)
+
+    def update_shopping(self, recipe_mults: List[Tuple[int, int]]) -> None:
+        rows = self.consolidate_ingredients(recipe_mults) if recipe_mults else []
         self.shopping_table.setRowCount(len(rows))
         for row, d in enumerate(rows):
             self.shopping_table.setItem(row, 0, QTableWidgetItem(d["name"]))
@@ -842,10 +1200,9 @@ class MainWindow(QMainWindow):
         export_recipe_card_pdf(Path(path_str), r, ings)
 
     def export_shopping_list_pdf(self) -> None:
-        ids = self.selected_recipe_ids()
-        if not ids:
+        if not self.selected_recipes:
             return
-        rows = self.consolidate_ingredients(ids)
+        rows = self.consolidate_ingredients(self.selected_recipes)
         lines: List[str] = []
         if rows:
             for d in rows:
